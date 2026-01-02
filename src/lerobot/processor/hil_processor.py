@@ -106,18 +106,37 @@ class AddTeleopActionAsComplimentaryDataStep(ComplementaryDataProcessorStep):
     teleop_device: Teleoperator
 
     def complementary_data(self, complementary_data: dict) -> dict:
-        """
-        Retrieves the teleoperator's action and adds it to the complementary data.
+        # 1. Get events
+        events = self.teleop_device.get_teleop_events()
+        
+        # 2. Get the Target Positions (IK_solution)
+        # This represents the current goal of the follower robot
+        ik_sol = complementary_data.get("IK_solution")
 
-        Args:
-            complementary_data: The incoming complementary data dictionary.
-
-        Returns:
-            A new dictionary with the teleoperator action added under the
-            `teleop_action` key.
-        """
-        new_complementary_data = dict(complementary_data)
+        # 3. Shadowing Logic
+        if not events.get(TeleopEvents.IS_INTERVENTION, False):
+            if ik_sol is not None:
+                # Map the IK array to a dictionary for the leader motors
+                # Assuming ik_sol is [shoulder_pan, shoulder_lift, elbow, wrist_flex, wrist_roll, gripper]
+                target_pos = {
+                    "shoulder_pan": ik_sol[0],
+                    "shoulder_lift": ik_sol[1],
+                    "elbow_flex": ik_sol[2],
+                    "wrist_flex": ik_sol[3],
+                    "wrist_roll": ik_sol[4],
+                    "gripper": ik_sol[5] if len(ik_sol) > 5 else 50.0
+                }
+                self.teleop_device.send_feedback({"target_joint_pos": target_pos})
+        
+        # 4. Update the data packet for the Learner/Policy
+        new_complementary_data = complementary_data.copy()
+        
+        # Capture the current XYZ+Gripper from leader (for intervention recording)
         new_complementary_data[TELEOP_ACTION_KEY] = self.teleop_device.get_action()
+        
+        # Merge events (is_intervention, success, etc.)
+        new_complementary_data.update(events)
+
         return new_complementary_data
 
     def transform_features(

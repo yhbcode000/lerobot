@@ -26,3 +26,14 @@ class SO101LeaderConfig(TeleoperatorConfig):
     port: str
 
     use_degrees: bool = False
+
+@TeleoperatorConfig.register_subclass("so101_leader_ee")
+@dataclass
+class SO101LeaderEndEffectorConfig(SO101LeaderConfig):
+    # Path to the URDF used by Placo
+    urdf_path: str | None = None
+    # The end-effector frame to track
+    target_frame_name: str = "moving_arm_link"
+    # Threshold for motor current/torque to trigger intervention
+    intervention_threshold: float = 50.0
+    

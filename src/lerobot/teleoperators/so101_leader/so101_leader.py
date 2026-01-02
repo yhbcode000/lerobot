@@ -15,17 +15,42 @@
 # limitations under the License.
 
 import logging
+from multiprocessing import Queue
 import time
+from typing import Any
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
     OperatingMode,
 )
+import os
+import sys
+try:
+    if ("DISPLAY" not in os.environ) and ("linux" in sys.platform):
+        logging.info("No DISPLAY set. Skipping pynput import.")
+        raise ImportError("pynput blocked intentionally due to no display.")
+
+    from pynput import keyboard
+except ImportError:
+    keyboard = None
+    PYNPUT_AVAILABLE = False
+except Exception as e:
+    keyboard = None
+    PYNPUT_AVAILABLE = False
+    logging.info(f"Could not import pynput: {e}")
+from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..teleoperator import Teleoperator
-from .config_so101_leader import SO101LeaderConfig
+from .config_so101_leader import (
+    SO101LeaderConfig, 
+    SO101LeaderEndEffectorConfig
+)
+
+import numpy as np
+
+import placo
 
 logger = logging.getLogger(__name__)
 
@@ -154,3 +179,111 @@ class SO101Leader(Teleoperator):
 
         self.bus.disconnect()
         logger.info(f"{self} disconnected.")
+
+class SO101LeaderEndEffector(SO101Leader):
+    config_class = SO101LeaderEndEffectorConfig
+    name = "so101_leader_ee"
+
+    def __init__(self, config: SO101LeaderEndEffectorConfig):
+        super().__init__(config)
+        self.config = config
+        
+        # 1. Kinematics Setup
+        self.model = placo.RobotWrapper(config.urdf_path)
+        self.joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+
+        # 2. State Management
+        self.misc_keys_queue = Queue()
+        self.listener = None
+        self.is_intervention_active = False
+        self.motors_initialized = False 
+        
+        # 3. Smoothing Variables
+        self.force_buffer = []
+        self.buffer_size = 5  # Number of frames to average to prevent spikes
+        self.cooldown_end_time = 0
+
+    def _set_torque(self, enable: bool):
+        state = 1 if enable else 0
+        for motor_name in self.bus.motors.keys():
+            try:
+                # FIXED: Correct argument order (Register, Value, Motor_Name)
+                self.bus.write("Torque_Enable", motor_name, state)
+            except Exception as e:
+                logger.error(f"Torque error on {motor_name}: {e}")
+        # Add a small delay after bulk torque change to let bus settle
+        time.sleep(0.05)
+
+    def send_feedback(self, feedback: dict[str, Any]) -> None:
+        if not self.is_connected:
+            return
+
+        # Recovery/Init: Only stiffen if we aren't currently being grabbed
+        if not self.motors_initialized and not self.is_intervention_active:
+            # Check cooldown to prevent rapid snap-back oscillations
+            if time.time() > self.cooldown_end_time:
+                self._set_torque(enable=True)
+                self.motors_initialized = True
+
+        # TELEOP MODE: Human is in control, Leader arm must stay limp
+        if self.is_intervention_active:
+            return
+        
+        target_joints = feedback.get("target_joint_pos")
+        if target_joints:
+            valid_targets = {k: v for k, v in target_joints.items() if k in self.bus.motors}
+            self.bus.sync_write("Goal_Position", valid_targets)
+
+    def get_teleop_events(self) -> dict[str, Any]:
+        if not self.is_connected:
+            return {TeleopEvents.IS_INTERVENTION: False, TeleopEvents.TERMINATE_EPISODE: False}
+
+        # --- Part A: Improved Force Detection ---
+        try:
+            currents = self.bus.sync_read("Present_Current")
+            arm_currents = [abs(val) for name, val in currents.items() if name != "gripper"]
+            raw_max_force = max(arm_currents) if arm_currents else 0
+            
+            # Simple Moving Average to smooth out motor spikes during shadowing
+            self.force_buffer.append(raw_max_force)
+            if len(self.force_buffer) > self.buffer_size:
+                self.force_buffer.pop(0)
+            avg_force = sum(self.force_buffer) / len(self.force_buffer)
+            
+            # Detect human intervention based on smoothed average
+            is_intervention = avg_force > self.config.intervention_threshold
+        except ConnectionError:
+            is_intervention = self.is_intervention_active
+
+        # TRANSITION: SHADOW -> TELEOP (Grabbed)
+        if is_intervention and not self.is_intervention_active:
+            self.is_intervention_active = True
+            self._set_torque(enable=False)
+            logger.info(">>> INTERVENTION START: Leader is now LIMP")
+        
+        # TRANSITION: TELEOP -> SHADOW (Released)
+        elif not is_intervention and self.is_intervention_active:
+            self.is_intervention_active = False
+            self.motors_initialized = False 
+            # Set a 0.5s cooldown before the arm stiffens up again
+            self.cooldown_end_time = time.time() + 0.5
+            logger.info("<<< INTERVENTION END: Preparing to Resume Shadowing")
+
+        # --- Part B: Keyboard ---
+        terminate_episode = False
+        success = False
+        rerecord_episode = False
+        while not self.misc_keys_queue.empty():
+            char = self.misc_keys_queue.get_nowait()
+            if char in ["s", "r", "q"]:
+                terminate_episode = True
+                self.motors_initialized = False
+                if char == "s": success = True
+                elif char == "r": rerecord_episode = True
+
+        return {
+            TeleopEvents.IS_INTERVENTION: self.is_intervention_active,
+            TeleopEvents.TERMINATE_EPISODE: terminate_episode,
+            TeleopEvents.SUCCESS: success,
+            TeleopEvents.RERECORD_EPISODE: rerecord_episode,
+        }

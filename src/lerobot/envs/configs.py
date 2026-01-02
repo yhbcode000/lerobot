@@ -20,7 +20,9 @@ import draccus
 
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.robots import RobotConfig
+from lerobot.robots.so101_follower import SO101FollowerConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
+from lerobot.teleoperators.so101_leader import SO101LeaderConfig
 from lerobot.utils.constants import (
     ACTION,
     LIBERO_KEY_EEF_MAT,

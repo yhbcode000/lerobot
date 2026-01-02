@@ -1,0 +1,21 @@
+# Robot Configuration (Follower)
+robot:
+  type: so101_follower
+  port: /dev/ttyACM0
+  id: R12255108
+  cameras:
+    handeye:
+      type: opencv
+      index_or_path: 4
+      width: 640
+      height: 360
+      fps: 30
+
+# Teleoperation Configuration (Leader)
+teleop:
+  type: so101_leader
+  port: /dev/ttyACM1
+  id: R07255108
+
+# Interface Settings
+display_data: true
